@@ -1,0 +1,35 @@
+# Trading Research System Requirements
+# =====================================
+
+# Core dependencies
+pandas>=2.2.2
+numpy>=2.1.0
+
+# Data fetching and API clients
+httpx==0.27.2
+requests>=2.31.0
+aiohttp>=3.9.1
+websockets>=11.0.3
+
+# Configuration management
+python-dotenv>=1.0.1
+
+# Backtesting engine
+# Note: backtesting library should be installed separately or from parent repo
+# Uncomment if you have the backtesting package available:
+# backtesting
+
+# Optional: For advanced features
+# python-telegram-bot>=21.6  # For Telegram integration
+# google-generativeai>=0.8.3  # For AI-powered analysis
+# MetaTrader5>=5.0.5488  # For MT5 integration
+# discord.py>=2.3.0  # For Discord integration
+# playwright>=1.40.0  # For web scraping
+# python-binance>=1.0.19  # For Binance crypto data
+
+# Development dependencies (optional)
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
+# black>=23.7.0
+# flake8>=6.1.0
+# mypy>=1.5.0
