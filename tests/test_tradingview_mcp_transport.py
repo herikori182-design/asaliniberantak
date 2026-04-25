@@ -17,6 +17,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.infoway_forex_fetcher import InfowayForexFetcher
 
+ADAPTER_CMD = "python tools/tradingview_mcp_adapter_example.py"
+
 
 class _TickHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler naming)
@@ -66,7 +68,7 @@ class TestTradingViewMCPTransport(unittest.TestCase):
         os.environ["TICK_COLLECTOR_SOURCE"] = "tradingview_mcp"
         os.environ["TRADINGVIEW_MCP_TRANSPORT"] = "command"
         os.environ["TRADINGVIEW_MCP_TOOL"] = "get_tick"
-        os.environ["TRADINGVIEW_MCP_COMMAND"] = "python tools/tradingview_mcp_adapter_example.py"
+        os.environ["TRADINGVIEW_MCP_COMMAND"] = ADAPTER_CMD
 
         f = InfowayForexFetcher()
         tick = f.get_tick("XAUUSD")
@@ -139,7 +141,7 @@ class TestTradingViewMCPTransport(unittest.TestCase):
         os.environ["TICK_COLLECTOR_SOURCE"] = "tradingview_mcp"
         os.environ["TRADINGVIEW_MCP_TRANSPORT"] = "command"
         os.environ["TRADINGVIEW_MCP_PINE_TOOL"] = "run_pinescript"
-        os.environ["TRADINGVIEW_MCP_COMMAND"] = "python tools/tradingview_mcp_adapter_example.py"
+        os.environ["TRADINGVIEW_MCP_COMMAND"] = ADAPTER_CMD
 
         f = InfowayForexFetcher()
         out = f.run_pinescript(

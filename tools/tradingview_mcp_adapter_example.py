@@ -12,7 +12,7 @@ Replace `_fetch_tick_from_your_mcp` with your TradingView MCP call logic.
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict
 
 

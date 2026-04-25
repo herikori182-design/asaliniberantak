@@ -55,7 +55,7 @@ Alternative (command transport, useful if you run MCP via CLI/adapter):
 ```bash
 TICK_COLLECTOR_SOURCE=tradingview_mcp
 TRADINGVIEW_MCP_TRANSPORT=command
-TRADINGVIEW_MCP_COMMAND=python tools/tradingview_mcp_adapter.py
+TRADINGVIEW_MCP_COMMAND=python tools/tradingview_mcp_adapter_example.py
 TRADINGVIEW_MCP_TOOL=get_tick
 TRADINGVIEW_MCP_PINE_TOOL=run_pinescript
 ```

@@ -368,7 +368,7 @@ class InfowayForexFetcher:
         - TRADINGVIEW_MCP_TRANSPORT=http|command
         - TRADINGVIEW_MCP_URL=<HTTP endpoint that accepts MCP tool call payload> (http mode)
         - TRADINGVIEW_MCP_TOOL=<tool name, default: get_tick>
-        - TRADINGVIEW_MCP_COMMAND=<adapter command> (command mode)
+        - TRADINGVIEW_MCP_COMMAND=<adapter command> (command mode, e.g. python tools/tradingview_mcp_adapter_example.py)
         """
         if self.tradingview_mcp_transport == "command":
             return self._get_tick_from_tradingview_mcp_command(symbol)
