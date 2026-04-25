@@ -105,6 +105,7 @@ class Strategy:
     entryType: Optional[Literal['Breakout', 'Pullback']] = None
     psychology: Optional[Dict[str, Any]] = None
     checklist: Optional[List[str]] = None
+    optimizationParamMap: Optional[Dict[str, str]] = None
 
     @classmethod
     def model_validate_json(cls, json_str: str) -> 'Strategy':

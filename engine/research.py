@@ -18,6 +18,8 @@ from pathlib import Path
 import time
 from concurrent.futures import ProcessPoolExecutor
 import itertools
+import copy
+import random
 
 from .schema import Strategy, IndicatorSpec, RuleCond, RuleSet, BacktestParams
 from .backtest import backtest_strategy
@@ -154,7 +156,44 @@ class StrategyOptimizer:
     def _modify_strategy(self, strategy: Strategy, params: Dict[str, Any]) -> Strategy:
         """Create modified strategy with new parameters"""
         # Create a deep copy of the strategy
-        strategy_dict = strategy.model_dump()
+        if hasattr(strategy, "model_dump"):
+            strategy_dict = strategy.model_dump()  # type: ignore[attr-defined]
+        else:
+            from dataclasses import asdict
+            strategy_dict = asdict(strategy)
+
+        def _set_nested(obj: Dict[str, Any], path: str, value: Any) -> bool:
+            cur = obj
+            keys = [k for k in str(path).split(".") if k]
+            if not keys:
+                return False
+            for k in keys[:-1]:
+                if isinstance(cur, list):
+                    try:
+                        idx = int(k)
+                        cur = cur[idx]
+                    except Exception:
+                        return False
+                else:
+                    if k not in cur:
+                        return False
+                    cur = cur[k]
+            last = keys[-1]
+            if isinstance(cur, list):
+                try:
+                    cur[int(last)] = value
+                    return True
+                except Exception:
+                    return False
+            cur[last] = value
+            return True
+
+        # Explicit mapping (recommended)
+        param_map = strategy_dict.get("optimizationParamMap") or {}
+        for p_name, p_val in params.items():
+            target_path = param_map.get(p_name)
+            if target_path:
+                _set_nested(strategy_dict, target_path, p_val)
 
         # Modify indicator parameters
         for indicator in strategy_dict['indicators']:
@@ -436,6 +475,126 @@ class StrategyResearcher:
 
         report.append("=" * 80)
         return "\n".join(report)
+
+
+@dataclass
+class ScalpKPIGate:
+    min_win_rate: float = 60.0
+    min_profit_factor: float = 1.8
+    min_rr: float = 1.2
+    max_drawdown: float = 0.2
+    min_trades_1m: int = 30
+    min_trades_6m: int = 100
+
+
+@dataclass
+class KPIGateResult:
+    passed: bool
+    reasons: List[str] = field(default_factory=list)
+    metrics: Dict[str, float] = field(default_factory=dict)
+
+
+class ResearchLoop:
+    """
+    improve -> retest -> reject/mutate -> retest until KPI pass or budget exhausted.
+    """
+
+    def __init__(self, kpi_gate: Optional[ScalpKPIGate] = None, max_iterations: int = 50):
+        self.kpi_gate = kpi_gate or ScalpKPIGate()
+        self.max_iterations = max_iterations
+        self.history: List[Dict[str, Any]] = []
+
+    def evaluate_kpi(self, metrics: Dict[str, float]) -> KPIGateResult:
+        reasons: List[str] = []
+        wr = float(metrics.get("win_rate", 0.0))
+        pf = float(metrics.get("profit_factor", 0.0))
+        rr = float(metrics.get("reward_risk_ratio", 0.0))
+        dd = float(metrics.get("max_drawdown", 1.0))
+        trades = int(metrics.get("total_trades", 0))
+
+        if wr < self.kpi_gate.min_win_rate:
+            reasons.append("win_rate_too_low")
+        if pf < self.kpi_gate.min_profit_factor:
+            reasons.append("profit_factor_too_low")
+        if rr < self.kpi_gate.min_rr:
+            reasons.append("reward_risk_ratio_too_low")
+        if dd > self.kpi_gate.max_drawdown:
+            reasons.append("drawdown_too_high")
+        if trades < self.kpi_gate.min_trades_1m:
+            reasons.append("too_few_trades")
+        if abs(int(metrics.get("long_trades", 0)) - int(metrics.get("short_trades", 0))) > trades * 0.8 and trades > 0:
+            reasons.append("direction_imbalance")
+
+        return KPIGateResult(passed=len(reasons) == 0, reasons=reasons, metrics=metrics)
+
+    def _mutate_candidate_params(
+        self,
+        base_params: Dict[str, Any],
+        parameter_ranges: Dict[str, List[Any]],
+        fail_reasons: List[str],
+    ) -> Dict[str, Any]:
+        out = dict(base_params or {})
+        keys = list(parameter_ranges.keys())
+        if not keys:
+            return out
+
+        target_keys = keys
+        if "too_few_trades" in fail_reasons:
+            target_keys = [k for k in keys if ("period" in k.lower() or "lookback" in k.lower())] or keys
+        elif "drawdown_too_high" in fail_reasons:
+            target_keys = [k for k in keys if ("atrstop" in k.lower() or "take" in k.lower())] or keys
+
+        n_mut = min(3, max(1, len(target_keys) // 3))
+        for k in random.sample(target_keys, k=min(n_mut, len(target_keys))):
+            vals = parameter_ranges.get(k) or []
+            if not vals:
+                continue
+            out[k] = random.choice(vals)
+        return out
+
+    async def run(
+        self,
+        base_strategy: Strategy,
+        symbol: str,
+        timeframe: str,
+        parameter_ranges: Dict[str, List[Any]],
+    ) -> Dict[str, Any]:
+        cfg = ResearchConfig(
+            symbol=symbol,
+            timeframe=timeframe,
+            optimization_method=OptimizationMethod.RANDOM_SEARCH,
+            objective=ObjectiveMetric.PROFIT_FACTOR,
+            max_iterations=1,
+            parallel_jobs=1,
+        )
+        optimizer = StrategyOptimizer(cfg)
+        params = {k: random.choice(v) for k, v in parameter_ranges.items() if v}
+
+        best: Optional[OptimizationResult] = None
+        for i in range(1, self.max_iterations + 1):
+            candidate = optimizer._modify_strategy(base_strategy, params)
+            result = await optimizer._evaluate_strategy(candidate, params)
+            if result is None:
+                gate = KPIGateResult(False, reasons=["evaluation_error"], metrics={})
+            else:
+                gate = self.evaluate_kpi(result.metrics)
+                if best is None or result.objective_value > best.objective_value:
+                    best = result
+
+            self.history.append(
+                {
+                    "iteration": i,
+                    "params": copy.deepcopy(params),
+                    "passed": gate.passed,
+                    "reasons": gate.reasons,
+                    "metrics": gate.metrics,
+                }
+            )
+            if gate.passed:
+                return {"status": "passed", "iteration": i, "best": best, "history": self.history}
+            params = self._mutate_candidate_params(params, parameter_ranges, gate.reasons)
+
+        return {"status": "budget_exhausted", "iteration": self.max_iterations, "best": best, "history": self.history}
 
 
 async def run_optimization_example():

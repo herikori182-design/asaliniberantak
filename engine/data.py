@@ -2,10 +2,14 @@ import logging
 import os
 import time
 import pandas as pd
+import json
+import shlex
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import sys
+import requests
 
 # Add parent directory to path for backtesting import
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -277,3 +281,152 @@ def get_cache_info() -> Dict[str, any]:
         logger.error(f"Failed to get cache info: {e}")
 
     return info
+
+
+def render_timeframe_from_m5(df_m5: pd.DataFrame, target_tf: str) -> pd.DataFrame:
+    """
+    Render higher timeframe candles from immutable M5 data.
+    Only supports 5m->(15m,30m,1h,4h,1d) transformations.
+    """
+    if df_m5.empty:
+        return df_m5
+    if target_tf == "5m":
+        return df_m5.copy()
+    if target_tf not in ("15m", "30m", "1h", "4h", "1d"):
+        raise ValueError(f"Unsupported M5 render target: {target_tf}")
+    return resample_ohlcv(df_m5, target_tf)
+
+
+class TradingViewMCPHistoricalDataSource:
+    """
+    Historical OHLCV source via TradingView MCP tool.
+
+    Environment:
+    - TRADINGVIEW_MCP_TRANSPORT=http|command
+    - TRADINGVIEW_MCP_URL=... (http)
+    - TRADINGVIEW_MCP_COMMAND=... (command)
+    - TRADINGVIEW_MCP_HIST_TOOL=get_historical_data
+    - TRADINGVIEW_MCP_EXCHANGE=OANDA (default)
+    """
+
+    def __init__(self):
+        self.transport = str(os.getenv("TRADINGVIEW_MCP_TRANSPORT") or "http").strip().lower()
+        self.url = str(os.getenv("TRADINGVIEW_MCP_URL") or "").strip()
+        self.command = str(os.getenv("TRADINGVIEW_MCP_COMMAND") or "").strip()
+        self.hist_tool = str(os.getenv("TRADINGVIEW_MCP_HIST_TOOL") or "get_historical_data").strip()
+        self.exchange = str(os.getenv("TRADINGVIEW_MCP_EXCHANGE") or "OANDA").strip()
+        self._session = requests.Session()
+
+    def _extract_mcp_result(self, body: Dict[str, Any]) -> Any:
+        if not isinstance(body, dict):
+            return body
+        result = body.get("result")
+        if isinstance(result, dict):
+            if isinstance(result.get("content"), list):
+                for item in result["content"]:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        try:
+                            return json.loads(item["text"])
+                        except Exception:
+                            continue
+            return result
+        content = body.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    try:
+                        return json.loads(item["text"])
+                    except Exception:
+                        continue
+        return body
+
+    def _call_tool(self, tool: str, arguments: Dict[str, Any]) -> Optional[Any]:
+        payload = {"tool": tool, "arguments": arguments}
+        if self.transport == "command":
+            if not self.command:
+                return None
+            try:
+                proc = subprocess.run(
+                    shlex.split(self.command),
+                    input=json.dumps(payload),
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    return None
+                stdout = (proc.stdout or "").strip()
+                if not stdout:
+                    return None
+                try:
+                    body = json.loads(stdout)
+                except Exception:
+                    body = json.loads(stdout.splitlines()[-1])
+                return self._extract_mcp_result(body if isinstance(body, dict) else {"result": body})
+            except Exception:
+                return None
+
+        if not self.url:
+            return None
+        try:
+            r = self._session.post(self.url, json=payload, timeout=30)
+            if r.status_code != 200:
+                return None
+            body = r.json()
+            return self._extract_mcp_result(body)
+        except Exception:
+            return None
+
+    def fetch_historical_m5(self, symbol: str, *, max_records: int = 5000) -> pd.DataFrame:
+        """
+        Fetch historical 5m OHLCV from TradingView MCP and return canonical DataFrame.
+        """
+        data = self._call_tool(
+            self.hist_tool,
+            {
+                "symbol": symbol,
+                "exchange": self.exchange,
+                "timeframe": "5m",
+                "max_records": int(max_records),
+            },
+        )
+        if data is None:
+            return pd.DataFrame()
+
+        records: List[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("candles"), list):
+                records = [x for x in data["candles"] if isinstance(x, dict)]
+            elif isinstance(data.get("data"), list):
+                records = [x for x in data["data"] if isinstance(x, dict)]
+        elif isinstance(data, list):
+            records = [x for x in data if isinstance(x, dict)]
+        if not records:
+            return pd.DataFrame()
+
+        out = []
+        for c in records:
+            ts = c.get("time") or c.get("timestamp") or c.get("t")
+            if ts is None:
+                continue
+            try:
+                ts_i = int(float(ts))
+            except Exception:
+                continue
+            if ts_i > 100_000_000_000:
+                ts_i //= 1000
+            out.append(
+                {
+                    "Date": datetime.utcfromtimestamp(ts_i),
+                    "Open": float(c.get("open", c.get("o", 0))),
+                    "High": float(c.get("high", c.get("h", 0))),
+                    "Low": float(c.get("low", c.get("l", 0))),
+                    "Close": float(c.get("close", c.get("c", 0))),
+                    "Volume": float(c.get("volume", c.get("v", 0))),
+                }
+            )
+        if not out:
+            return pd.DataFrame()
+        df = pd.DataFrame(out).set_index("Date").sort_index()
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()

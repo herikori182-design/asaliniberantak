@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,7 +29,7 @@ def crossover(series1: List[float], series2: List[float]) -> bool:
         return False
     return prev1 <= prev2 and curr1 > curr2
 
-from .data import DEFAULT_DAYS, TIMEFRAMES, _tf_to_ms, load_cached
+from .data import DEFAULT_DAYS, TIMEFRAMES, _tf_to_ms, load_cached, render_timeframe_from_m5
 from .schema import RuleCond, Strategy as DSLStrategy
 
 logger = logging.getLogger(__name__)
@@ -412,30 +413,26 @@ def _build_entry_masks(
         # LONG
         if rule_set.entryLong and _all_conds(rule_set.entryLong, i, ind_map_analysis, df_analysis):
             if confirm_enabled and confirm_rule_set.confirmLong:
-                until = ts + pd.Timedelta(milliseconds=confirm_tf_ms * confirm_window_bars)
-                df_slice = df_confirm.loc[(df_confirm.index >= ts) & (df_confirm.index <= until)]
-                ok = False
-                for t in df_slice.index:
-                    idx_c = df_confirm.index.get_loc(t)
-                    if _all_conds(confirm_rule_set.confirmLong, idx_c, ind_map_confirm, df_confirm):  # type: ignore
-                        ok = True
-                        break
-                long_mask[i] = ok
+                # Anti-lookahead: only latest already-closed confirm bar (<= analysis ts)
+                df_slice = df_confirm.loc[df_confirm.index <= ts]
+                if len(df_slice) > 0:
+                    idx_c = len(df_slice) - 1
+                    long_mask[i] = _all_conds(confirm_rule_set.confirmLong, idx_c, ind_map_confirm, df_confirm)  # type: ignore
+                else:
+                    long_mask[i] = False
             else:
                 long_mask[i] = True
 
         # SHORT
         if rule_set.entryShort and _all_conds(rule_set.entryShort, i, ind_map_analysis, df_analysis):
             if confirm_enabled and confirm_rule_set.confirmShort:
-                until = ts + pd.Timedelta(milliseconds=confirm_tf_ms * confirm_window_bars)
-                df_slice = df_confirm.loc[(df_confirm.index >= ts) & (df_confirm.index <= until)]
-                ok = False
-                for t in df_slice.index:
-                    idx_c = df_confirm.index.get_loc(t)
-                    if _all_conds(confirm_rule_set.confirmShort, idx_c, ind_map_confirm, df_confirm):  # type: ignore
-                        ok = True
-                        break
-                short_mask[i] = ok
+                # Anti-lookahead: only latest already-closed confirm bar (<= analysis ts)
+                df_slice = df_confirm.loc[df_confirm.index <= ts]
+                if len(df_slice) > 0:
+                    idx_c = len(df_slice) - 1
+                    short_mask[i] = _all_conds(confirm_rule_set.confirmShort, idx_c, ind_map_confirm, df_confirm)  # type: ignore
+                else:
+                    short_mask[i] = False
             else:
                 short_mask[i] = True
 
@@ -487,8 +484,12 @@ async def backtest_strategy(strategy: DSLStrategy, pair: str, *, timeframe: Opti
 
     analysis_tf = strategy.analysisTimeframe or strategy.preferredTimeframe or timeframe or "1h"
     confirm_tf = strategy.confirmTimeframe if strategy.confirmRuleSet else None
-
-    df_analysis = load_cached(pair, analysis_tf, days=DEFAULT_DAYS)
+    mtf_from_m5_only = str(os.getenv("BACKTEST_MTF_FROM_M5_ONLY") or "true").strip().lower() in ("1", "true", "yes", "on")
+    if mtf_from_m5_only and analysis_tf != "5m":
+        df_m5 = load_cached(pair, "5m", days=DEFAULT_DAYS)
+        df_analysis = render_timeframe_from_m5(df_m5, analysis_tf) if not df_m5.empty else pd.DataFrame()
+    else:
+        df_analysis = load_cached(pair, analysis_tf, days=DEFAULT_DAYS)
     if df_analysis.empty:
         logger.warning(f"No cached data for {pair} {analysis_tf}. Run /getalldata first.")
         return {
@@ -518,7 +519,11 @@ async def backtest_strategy(strategy: DSLStrategy, pair: str, *, timeframe: Opti
         if confirm_tf not in TIMEFRAMES:
             logger.warning(f"Confirm timeframe {confirm_tf} not in supported set; skipping confirm.")
         else:
-            df_confirm = load_cached(pair, confirm_tf, days=DEFAULT_DAYS)
+            if mtf_from_m5_only and confirm_tf != "5m":
+                df_m5c = load_cached(pair, "5m", days=DEFAULT_DAYS)
+                df_confirm = render_timeframe_from_m5(df_m5c, confirm_tf) if not df_m5c.empty else pd.DataFrame()
+            else:
+                df_confirm = load_cached(pair, confirm_tf, days=DEFAULT_DAYS)
             if df_confirm.empty:
                 logger.warning(f"No cached data for {pair} {confirm_tf}; skipping confirm.")
                 df_confirm = None
