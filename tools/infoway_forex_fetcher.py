@@ -25,6 +25,9 @@ import requests
 import pandas as pd
 import asyncio
 import aiohttp
+import json
+import shlex
+import subprocess
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 import time
@@ -95,6 +98,11 @@ class InfowayForexFetcher:
     }
     def __init__(self, api_key: str = None):
         self.api_key = api_key or self.API_KEY
+        self.tick_source = str(os.getenv("TICK_COLLECTOR_SOURCE") or "infoway").strip().lower()
+        self.tradingview_mcp_transport = str(os.getenv("TRADINGVIEW_MCP_TRANSPORT") or "http").strip().lower()
+        self.tradingview_mcp_url = str(os.getenv("TRADINGVIEW_MCP_URL") or "").strip()
+        self.tradingview_mcp_tool = str(os.getenv("TRADINGVIEW_MCP_TOOL") or "get_tick").strip()
+        self.tradingview_mcp_command = str(os.getenv("TRADINGVIEW_MCP_COMMAND") or "").strip()
         self._trust_env_proxy = str(os.getenv("INFOWAY_TRUST_ENV_PROXY") or "false").strip().lower() in (
             "1",
             "true",
@@ -173,6 +181,9 @@ class InfowayForexFetcher:
 
         Returns dict with: bid, ask, spread, last_price, timestamp, volume
         """
+        if self.tick_source == "tradingview_mcp":
+            return self._get_tick_from_tradingview_mcp(symbol)
+
         try:
             infoway_symbol = self._get_infoway_symbol(symbol)
             if not infoway_symbol:
@@ -240,6 +251,205 @@ class InfowayForexFetcher:
 
         except Exception as e:
             print(f"Infoway tick error for {symbol}: {e}")
+            return None
+
+    def _coerce_tick_payload(self, symbol: str, payload: Dict[str, Any]) -> Optional[Dict]:
+        """Normalize TradingView MCP tick payload to shared output schema."""
+        if not isinstance(payload, dict):
+            return None
+        try:
+            bid = payload.get("bid")
+            ask = payload.get("ask")
+            last = payload.get("last") or payload.get("price") or payload.get("close")
+            mid = payload.get("mid")
+            spread = payload.get("spread")
+            volume = payload.get("volume", 0)
+            ts = payload.get("timestamp") or payload.get("time")
+
+            bid_f = float(bid) if bid is not None else None
+            ask_f = float(ask) if ask is not None else None
+            last_f = float(last) if last is not None else None
+            mid_f = float(mid) if mid is not None else None
+
+            # Derive missing pricing fields from available values.
+            if bid_f is None and ask_f is not None and spread is not None:
+                bid_f = float(ask_f) - float(spread)
+            if ask_f is None and bid_f is not None and spread is not None:
+                ask_f = float(bid_f) + float(spread)
+            if mid_f is None:
+                if bid_f is not None and ask_f is not None:
+                    mid_f = (bid_f + ask_f) / 2
+                elif last_f is not None:
+                    mid_f = last_f
+            if bid_f is None and mid_f is not None:
+                bid_f = mid_f
+            if ask_f is None and mid_f is not None:
+                ask_f = mid_f
+            if last_f is None and mid_f is not None:
+                last_f = mid_f
+
+            if bid_f is None or ask_f is None or mid_f is None:
+                return None
+
+            spread_f = float(spread) if spread is not None else (ask_f - bid_f)
+            if ts is None:
+                timestamp = datetime.now(timezone.utc)
+            elif isinstance(ts, (int, float)):
+                ts_float = float(ts)
+                if ts_float > 100_000_000_000:
+                    ts_float = ts_float / 1000
+                timestamp = datetime.fromtimestamp(ts_float, tz=timezone.utc)
+            elif isinstance(ts, str):
+                try:
+                    timestamp = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    timestamp = datetime.now(timezone.utc)
+            else:
+                timestamp = datetime.now(timezone.utc)
+
+            return {
+                "symbol": str(payload.get("symbol") or symbol).upper(),
+                "bid": bid_f,
+                "ask": ask_f,
+                "spread": spread_f,
+                "last": last_f,
+                "mid": mid_f,
+                "volume": float(volume or 0),
+                "timestamp": timestamp,
+                "source": "tradingview_mcp",
+            }
+        except Exception:
+            return None
+
+    def _extract_mcp_result(self, body: Dict[str, Any]) -> Optional[Dict]:
+        """Extract structured tool result from common MCP HTTP bridge response shapes."""
+        if not isinstance(body, dict):
+            return None
+        result = body.get("result")
+        if isinstance(result, dict):
+            if isinstance(result.get("content"), list):
+                for item in result["content"]:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if not isinstance(text, str):
+                        continue
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        continue
+            return result
+
+        content = body.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
+        return body if isinstance(body, dict) else None
+
+    def _get_tick_from_tradingview_mcp(self, symbol: str) -> Optional[Dict]:
+        """
+        Get tick data from TradingView MCP bridge.
+
+        Expected env:
+        - TICK_COLLECTOR_SOURCE=tradingview_mcp
+        - TRADINGVIEW_MCP_TRANSPORT=http|command
+        - TRADINGVIEW_MCP_URL=<HTTP endpoint that accepts MCP tool call payload> (http mode)
+        - TRADINGVIEW_MCP_TOOL=<tool name, default: get_tick>
+        - TRADINGVIEW_MCP_COMMAND=<adapter command> (command mode)
+        """
+        if self.tradingview_mcp_transport == "command":
+            return self._get_tick_from_tradingview_mcp_command(symbol)
+        return self._get_tick_from_tradingview_mcp_http(symbol)
+
+    def _get_tick_from_tradingview_mcp_http(self, symbol: str) -> Optional[Dict]:
+        """HTTP transport: send MCP tool call payload to bridge URL."""
+        if not self.tradingview_mcp_url:
+            print("TradingView MCP URL not configured (TRADINGVIEW_MCP_URL).")
+            return None
+        try:
+            payload = {
+                "tool": self.tradingview_mcp_tool,
+                "arguments": {"symbol": symbol},
+            }
+            response = self._request("POST", self.tradingview_mcp_url, timeout=10, json=payload)
+            if response.status_code != 200:
+                print(f"TradingView MCP tick error for {symbol}: HTTP {response.status_code}")
+                return None
+            body = response.json()
+            parsed = self._extract_mcp_result(body)
+            return self._coerce_tick_payload(symbol, parsed or {})
+        except Exception as e:
+            print(f"TradingView MCP tick error for {symbol}: {e}")
+            return None
+
+    def _get_tick_from_tradingview_mcp_command(self, symbol: str) -> Optional[Dict]:
+        """
+        Command transport: execute adapter command and pass request JSON via stdin.
+
+        Adapter contract:
+        - stdin: {"tool":"get_tick","arguments":{"symbol":"XAUUSD"}}
+        - stdout: any JSON shape compatible with `_extract_mcp_result`.
+        """
+        if not self.tradingview_mcp_command:
+            print("TradingView MCP command not configured (TRADINGVIEW_MCP_COMMAND).")
+            return None
+        try:
+            args = shlex.split(self.tradingview_mcp_command)
+            if not args:
+                return None
+            payload = {
+                "tool": self.tradingview_mcp_tool,
+                "arguments": {"symbol": symbol},
+            }
+            proc = subprocess.run(
+                args,
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                print(f"TradingView MCP command tick error for {symbol}: rc={proc.returncode} {stderr}")
+                return None
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                return None
+
+            # Some adapters may log around the JSON. Try exact parse first, then line-wise.
+            try:
+                body = json.loads(stdout)
+            except Exception:
+                body = None
+                for line in reversed(stdout.splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        body = json.loads(line)
+                        break
+                    except Exception:
+                        continue
+                if body is None:
+                    return None
+
+            parsed = self._extract_mcp_result(body if isinstance(body, dict) else {"result": body})
+            return self._coerce_tick_payload(symbol, parsed or {})
+        except Exception as e:
+            print(f"TradingView MCP command tick error for {symbol}: {e}")
             return None
 
     def get_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 100) -> Optional[pd.DataFrame]:
@@ -418,6 +628,14 @@ class InfowayForexFetcher:
 
     def get_multiple_ticks(self, symbols: List[str]) -> List[Dict]:
         """Get tick data for multiple symbols"""
+        if self.tick_source == "tradingview_mcp":
+            results = []
+            for symbol in symbols:
+                tick = self.get_tick(symbol)
+                if tick:
+                    results.append(tick)
+            return results
+
         results = []
 
         # Batch request with multiple symbols
