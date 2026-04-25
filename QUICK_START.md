@@ -36,6 +36,36 @@ Edit the `.env` file and add your Infoway API key:
 INFOWAY_API_KEY=your_actual_api_key_here
 ```
 
+### Optional: Use TradingView MCP as Tick Source
+
+If you want live tick collection from TradingView MCP (instead of Infoway depth/trade), add:
+
+```bash
+TICK_COLLECTOR_SOURCE=tradingview_mcp
+TRADINGVIEW_MCP_TRANSPORT=http
+TRADINGVIEW_MCP_URL=http://127.0.0.1:8000/mcp/tools/call
+TRADINGVIEW_MCP_TOOL=get_tick
+```
+
+`TRADINGVIEW_MCP_URL` must point to your MCP HTTP bridge endpoint that accepts JSON payload:
+`{"tool": "<tool_name>", "arguments": {"symbol": "XAUUSD"}}`.
+
+Alternative (command transport, useful if you run MCP via CLI/adapter):
+
+```bash
+TICK_COLLECTOR_SOURCE=tradingview_mcp
+TRADINGVIEW_MCP_TRANSPORT=command
+TRADINGVIEW_MCP_COMMAND=python tools/tradingview_mcp_adapter.py
+TRADINGVIEW_MCP_TOOL=get_tick
+```
+
+Command adapter contract:
+- Input (stdin): `{"tool":"get_tick","arguments":{"symbol":"XAUUSD"}}`
+- Output (stdout): JSON object containing tick fields (`bid/ask/mid/last/...`) or MCP-style wrapped result.
+
+If you run MCP through Claude Code + Z.AI GLM Coding Plan, configure your Claude client as documented by Z.AI
+(`ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`) and point `TRADINGVIEW_MCP_COMMAND` to your local adapter/bridge command.
+
 ## First Steps (3 minutes)
 
 ### Step 1: Verify Installation
